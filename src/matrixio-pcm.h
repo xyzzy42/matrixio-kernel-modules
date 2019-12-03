@@ -45,8 +45,6 @@ struct matrixio_substream {
 struct matrixio_mic_substream {
 	struct matrixio *mio;
 	unsigned irq;
-	struct workqueue_struct *wq;
-	struct work_struct work;
 	struct snd_pcm_substream *substream;
 
 	spinlock_t worker_lock; /* Use in atomic trigger callback, can't be mutex */
@@ -59,17 +57,19 @@ struct matrixio_mic_substream {
 
 /* Managing races:
  *
- * The irq handler only needs the matriox_substream itself, and the flag, work
- * and wq members.  Do not delete these without first freeing the irq.	Use the
- * atomic flag methods with the flags.	The capture on bit is NOT enough to
- * prevent a race vs the irq handler; it is only meant to reduce the performance
- * impact of the "always on" irq design of the matrix io pcm.
+ * The hard irq handler only uses the matriox_substream itself and the flag
+ * bits.  Do not delete these without first freeing the irq.  Use the atomic
+ * flag methods with the flags.  The "capture on" bit is NOT enough to prevent a
+ * race vs the irq handler; it is only meant to reduce the performance impact of
+ * the "always on" irq design of the matrixio pcm.
  *
- * The workqueue will need various pcm data and one should not modify the
- * position field while the worker might be running.  To do this, do not modify
- * position while the pcm substream is active without holding the worker_lock.
- * Also insure the worker is no longer running when the pcm substream stops.  It
- * is ok to read the position without holding worker_lock, as nothing which
+ * The threaded part of the irq handler will need various pcm data, especially
+ * the runtime's dma_buffer and the matrixio_pcm's position.
+ * Do not modify position while the pcm substream is active without holding
+ * worker_lock.
+ * It is ok to read the position without holding worker_lock, as nothing which
  * writes to position is permitted to set it to an incorrect value at any time.
+ * Also insure the threaded irq will no longer use any runtime fields before
+ * allowing the substream to stop.
  */
 #endif

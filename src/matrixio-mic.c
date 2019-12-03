@@ -60,9 +60,10 @@ static struct snd_pcm_hardware matrixio_pcm_capture_hw = {
 	.periods_max = MATRIXIO_BUFFER_MAX / MATRIXIO_PERIOD_BYTES_PER_CH,
 };
 
-static void matrixio_pcm_capture_work(struct work_struct *wk)
+/* Threaded portion of interrupt handler */
+static irqreturn_t matrixio_pcm_thread(int irq, void *irq_data)
 {
-	struct matrixio_mic_substream *ms = container_of(wk, struct matrixio_mic_substream, work);
+	struct matrixio_mic_substream *ms = irq_data;
 	struct snd_pcm_substream *substream = ms->substream;
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	unsigned long flags;
@@ -79,21 +80,21 @@ static void matrixio_pcm_capture_work(struct work_struct *wk)
 	clear_bit(1, &ms->flags);
 	if (ret) {
 		pcm_err(substream->pcm, "matrixio SPI read failed (%d)\n", ret);
-		return;
+		return IRQ_HANDLED;
 	}
 
 	spin_lock_irqsave(&ms->worker_lock, flags);
-	/* Just return if we've stopped to audio process.  This device has no
+	/* Just return if we've stopped the audio process.  This device has no
 	 * way to stop the interrupts.	*/
 	if (!test_bit(0, &ms->flags)) {
 		spin_unlock_irqrestore(&ms->worker_lock, flags);
-		return;
+		return IRQ_HANDLED;
 	}
 	if (!runtime->dma_area) {
 		/* This should not happen */
 		pcm_err(substream->pcm, "DMA buffer missing!");
 		spin_unlock_irqrestore(&ms->worker_lock, flags);
-		return;
+		return IRQ_HANDLED;
 	}
 	pos = atomic_read(&ms->position);
 	/* Interleave data from fragment into "dma" buffer */
@@ -110,6 +111,7 @@ static void matrixio_pcm_capture_work(struct work_struct *wk)
 	spin_unlock_irqrestore(&ms->worker_lock, flags);
 
 	snd_pcm_period_elapsed(ms->substream);
+	return IRQ_HANDLED;
 }
 
 static irqreturn_t matrixio_pcm_interrupt(int irq, void *irq_data)
@@ -125,11 +127,10 @@ static irqreturn_t matrixio_pcm_interrupt(int irq, void *irq_data)
 
 	if (test_and_set_bit(1, &ms->flags)) {
 		/* Buffer was not yet empty */
-		pcm_warn(ms->substream->pcm, "Possible overflow, work queue not keeping up\n");
+		pcm_warn(ms->substream->pcm, "Possible overflow, irq thread not keeping up\n");
 	}
-	queue_work(ms->wq, &ms->work);
 
-	return IRQ_HANDLED;
+	return IRQ_WAKE_THREAD;
 }
 
 static int matrixio_pcm_open(struct snd_pcm_substream *substream)
@@ -151,26 +152,16 @@ static int matrixio_pcm_open(struct snd_pcm_substream *substream)
 
 	atomic_set(&ms->position, 0);
 
-	ms->wq = alloc_workqueue("matrixio-mic", WQ_HIGHPRI | WQ_UNBOUND, 1);
-	if (!ms->wq) {
-		ret = -ENOMEM;
-		goto fail_substream;
-	}
-
-	INIT_WORK(&ms->work, matrixio_pcm_capture_work);
-
 	/* Clear the running flag, so the irq handler will not do anything when it starts */
 	clear_bit(0, &ms->flags);
 	smp_mb__after_atomic();
-	ret = request_irq(ms->irq, matrixio_pcm_interrupt, 0,
-			  "matrixio-mic", ms);
+	ret = request_threaded_irq(ms->irq, matrixio_pcm_interrupt, matrixio_pcm_thread, 0,
+			           "matrixio-mic", ms);
 	if (ret < 0)
-		goto fail_workqueue;
+		goto fail_substream;
 
 	return 0;
 
- fail_workqueue:
-	destroy_workqueue(ms->wq);
  fail_substream:
 	ms->substream = NULL;
 
@@ -181,8 +172,6 @@ static int matrixio_pcm_close(struct snd_pcm_substream *substream)
 {
 	clear_bit(0, &ms->flags); /* Should already be clear from trigger stop, but just in case */
 	free_irq(ms->irq, ms);
-	destroy_workqueue(ms->wq);
-	cancel_work_sync(&ms->work);
 	ms->substream = NULL;
 
 	return 0;
@@ -200,7 +189,7 @@ static int matrixio_pcm_trigger(struct snd_pcm_substream *substream,
 		return 0;
 	case SNDRV_PCM_TRIGGER_STOP:
 		pcm_dbg(substream->pcm, "stopping");
-		/* We need the lock here to insure the work function is not in
+		/* We need the lock here to insure the irq thread is not in
 		 * the middle of processing audio data into the dma buffer */
 		spin_lock_irqsave(&ms->worker_lock, flags);
 		clear_bit(0, &ms->flags);
@@ -257,8 +246,6 @@ static int matrixio_pcm_hw_free(struct snd_pcm_substream *substream)
 {
 	/* Capture should have been stopped already */
 	snd_BUG_ON(test_bit(0, &ms->flags));
-	/* Make sure work function is finished */
-	flush_workqueue(ms->wq);
 	return snd_pcm_lib_free_vmalloc_buffer(substream);
 }
 
@@ -268,7 +255,7 @@ static int matrixio_pcm_prepare(struct snd_pcm_substream *substream)
 		pcm_err(substream->pcm, "Need %u frames/period, got %lu\n", MATRIXIO_PERIOD_FRAMES, substream->runtime->period_size);
 		return -EINVAL;
 	}
-	/* We don't need the lock since the work queue can not be running when prepare is called */
+	/* We don't need the lock since the irq thread can not be running when prepare is called */
 	atomic_set(&ms->position, 0);
 	return 0;
 }
